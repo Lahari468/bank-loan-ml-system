@@ -1,0 +1,84 @@
+version: 0.2
+env:
+  variables:
+    ECR_REPO_NAME: "bank-loan-ml"
+    EKS_CLUSTER_NAME: "bank-loan-eks-cluster"
+    CONTAINER_NAME: "bank-loan-ml-api"
+    KUBECTL_VERSION: "1.29.0"
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - echo "=== Installing kubectl ==="
+      - curl -LO "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+      - chmod +x kubectl
+      - mv kubectl /usr/local/bin/kubectl
+      - kubectl version --client
+
+      - echo "=== Installing eksctl ==="
+      - curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
+      - mv /tmp/eksctl /usr/local/bin/eksctl
+      - eksctl version
+
+      - echo "=== Installing Python dependencies ==="
+      - pip install --upgrade pip
+      - pip install -r requirements.txt
+
+  pre_build:
+    commands:
+      - echo "=== Logging in to Amazon ECR ==="
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+
+      - echo "=== Setting image URI ==="
+      - ECR_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO_NAME
+      - IMAGE_TAG=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c1-8)
+      - IMAGE_URI=$ECR_URI:$IMAGE_TAG
+      - LATEST_URI=$ECR_URI:latest
+      - echo "Image URI -> $IMAGE_URI"
+
+      - echo "=== Training ML model ==="
+      - python model/train.py
+
+  build:
+    commands:
+      - echo "=== Building Docker image ==="
+      - docker build -t $IMAGE_URI -f docker/Dockerfile .
+      - docker tag $IMAGE_URI $LATEST_URI
+      - echo "Docker build complete: $IMAGE_URI"
+  post_build:
+    commands:
+      - echo "=== Pushing Docker image to ECR ==="
+      - docker push $IMAGE_URI
+      - docker push $LATEST_URI
+      - echo "Push complete."
+
+      - echo "=== Configuring kubectl for EKS ==="
+      - aws eks update-kubeconfig --region $AWS_DEFAULT_REGION --name $EKS_CLUSTER_NAME
+
+      - echo "=== Updating Kubernetes deployment ==="
+      - sed -i "s|PLACEHOLDER_ECR_IMAGE_URI|$IMAGE_URI|g" k8s/deployment.yaml
+
+      - kubectl apply -f k8s/deployment.yaml
+      - kubectl apply -f k8s/service.yaml
+
+      - kubectl rollout restart deployment/bank-loan-ml-api
+
+      - kubectl rollout status deployment/bank-loan-ml-api --timeout=300s
+
+      - echo "=== Deployment complete ==="
+      - kubectl get pods -l app=bank-loan-ml-api
+      - kubectl get service bank-loan-ml-service
+
+      - printf '{"ImageURI":"%s"}' $IMAGE_URI > imageDetail.json
+artifacts:
+  files:
+    - imageDetail.json
+    - k8s/deployment.yaml
+    - k8s/service.yaml
+  discard-paths: no
+
+cache:
+  paths:
+    - "/root/.cache/pip/**/*"
